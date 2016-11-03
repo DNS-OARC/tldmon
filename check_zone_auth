@@ -1,0 +1,678 @@
+#!/usr/local/bin/perl
+
+# $Id: check_zone_auth,v 1.31 2014/03/29 22:25:05 wfms Exp $
+#
+# check_zone_auth
+#
+# nagios plugin to check that all authoritative nameservers for a zone
+# have the same NS RRset and the same serial number.
+#
+# options
+#	-Z zone to test
+#	-d enable debugging
+#	-A test for AA only
+#	-L test for lameness only
+#	-N test for NS RRset consistency only
+#	-O test for open recursion
+#	-R test for RCODE
+#	-S test for serial match only
+#	-T test for TCP query support
+#	-E test for EDNS support
+#	-6 test of one IPv6 reachable nameserver
+#	-K test for clock skew
+
+# Copyright (c) 2008, The Measurement Factory, Inc. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# Redistributions of source code must retain the above copyright
+# notice, this list of conditions and the following disclaimer.
+# Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution.
+# Neither the name of The Measurement Factory nor the names of its
+# contributors may be used to endorse or promote products derived
+# from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# With modifications made by DNS-OARC
+
+# usage
+#
+# define command {
+#   command_name    check-zone-auth
+#   command_line    /usr/local/libexec/nagios-local/check_zone_auth -Z $HOSTADDRESS$
+# }
+#
+# define service {
+#   name		   dns-auth-service
+#   check_command	   check-zone-auth
+#   ...
+# }
+#
+# define host {
+#   use dns-zone
+#   host_name zone.example.com
+#   alias ZONE example.com
+# }
+#
+# define service {
+#   use dns-auth-service
+#   host_name zone.example.com
+# }
+
+use warnings;
+use strict;
+
+use Getopt::Std;
+use Net::DNS::Resolver;
+use Net::DNS::Resolver::Recurse;
+use Time::HiRes qw ( gettimeofday tv_interval);
+use List::Util qw ( shuffle );
+use Storable;
+use Data::Dumper;
+use List::Compare;
+
+my %opts = (t=>10);
+getopts('t:Z:dAEKLNMORST6', \%opts);
+usage() unless $opts{Z};
+usage() if $opts{h};
+my $zone = $opts{Z};
+$zone =~ s/^zone\.//;
+$zone = '.' if $zone eq 'ROOT';
+#$zone =~ tr/A-Z/a-z/;
+
+unless ($opts{A} || $opts{E} || $opts{L} || $opts{N} || $opts{O} || $opts{R} || $opts{S} || $opts{T} || $opts{6} || $opts{M} || $opts{K}) {
+	$opts{A} =  $opts{E} =  $opts{L} =  $opts{N} =  $opts{O} =  $opts{R} =  $opts{S} =  $opts{T} =  $opts{6} = $opts{K} = 1;
+}
+
+my $data;
+
+my $start;
+my $stop;
+
+my @refs = qw (
+a.root-servers.net
+b.root-servers.net
+c.root-servers.net
+d.root-servers.net
+e.root-servers.net
+f.root-servers.net
+g.root-servers.net
+h.root-servers.net
+i.root-servers.net
+j.root-servers.net
+k.root-servers.net
+l.root-servers.net
+m.root-servers.net
+);
+
+$start = [gettimeofday()];
+do_recursion();
+my $parent_data = Storable::dclone($data);
+do_queries();
+do_analyze();
+exit 0;
+
+sub do_recursion {
+	my $done = 0;
+	my $res = Net::DNS::Resolver->new;
+	do {
+		print STDERR "\nRECURSE\n" if $opts{d};
+		my $pkt;
+		foreach my $ns (shuffle @refs) {
+			print STDERR "sending query for $zone SOA to $ns\n" if $opts{d};
+			my @addrs = nsaddrs($ns);
+			next unless @addrs;
+			$res->nameserver(@addrs);
+			$res->udp_timeout($opts{t});
+			$pkt = $res->send($zone, 'SOA');
+			last if $pkt;
+		}
+		critical("No response to seed query") unless $pkt;
+		critical($pkt->header->rcode . " from " . $pkt->answerfrom)
+			unless ($pkt->header->rcode eq 'NOERROR');
+		@refs = ();
+		foreach my $rr ($pkt->authority) {
+			print STDERR $rr->string, "\n" if $opts{d};
+			push (@refs, $rr->nsdname);
+			next unless lc($rr->name) eq lc($zone);
+			add_nslist_to_data($pkt);
+			$done = 1;
+			last;
+		}
+	} while (! $done);
+}
+
+
+sub do_queries {
+	my $n;
+	do {
+		$n = 0;
+		foreach my $ns (keys %$data) {
+			next if $data->{$ns}->{done};
+			print STDERR "\nQUERY $ns\n" if $opts{d};
+			my $pkt = send_query($zone, 'SOA', $ns);
+			add_nslist_to_data($pkt);
+			$data->{$ns}->{queries}->{SOA} = $pkt;
+
+			if ($pkt && $pkt->header->nscount == 0) {
+				print STDERR "querying $zone NS \@$ns\n" if $opts{d};
+				my $ns_pkt = send_query($zone, 'NS', $ns);
+				add_nslist_to_data($ns_pkt);
+				$data->{$ns}->{queries}->{NS} = $ns_pkt;
+			} elsif (!$pkt) {
+				print STDERR "timeout from $ns\n" if $opts{d};
+			}
+
+			print STDERR "done with $ns\n" if $opts{d};
+			$data->{$ns}->{done} = 1;
+			$n++;
+		}
+	} while ($n);
+}
+
+sub is_lame {
+	my $pkt = shift;
+	return 1 if 0 == $pkt->header->ancount;
+	# should be more sophisticated here.  check for SOA and zone match
+	return 0;
+}
+
+sub is_response {
+	my $pkt = shift;
+	return $pkt ? 1 : 0;
+}
+
+sub is_noerror {
+	my $pkt = shift;
+	return $pkt->header->rcode eq 'NOERROR' ? 1 : 0;
+}
+
+sub do_analyze {
+	my $maxserial = 0;
+	my $nscount = 0;
+	my $success_msg = '';
+
+	# ZONE CHECK
+	foreach my $ns (keys %$data) {
+		$nscount++;
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		print STDERR "\nRESPONSE FROM $ns\n" if $opts{d};
+		print STDERR $soa_pkt->string if $opts{d};
+	}
+	warning("No nameservers found.  Is '$zone' a zone?") if ($nscount < 1);
+
+	# RCODE CHECK
+	if ($opts{R}) {
+	    my $N = 0;
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		critical("No response from %NS%", $ns) unless is_response($soa_pkt);
+		critical($soa_pkt->header->rcode . " from %NS%", $ns) unless ($soa_pkt->header->rcode eq 'NOERROR');
+		$N++;
+	    }
+	    success("$N nameservers responding");
+	}
+
+	# LAME CHECK
+	if ($opts{L}) {
+	    my $N = 0;
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		critical("%NS% is lame", $ns) if is_lame($soa_pkt);
+		$N++;
+	    }
+	    success("$N nameservers are not lame");
+	}
+
+	# NSSET CHECK
+	if ($opts{N}) {
+	    my @lamers = ();
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		push(@lamers, $ns) if is_lame($soa_pkt);
+	    }
+	    my $N = 0;
+	    my $probs;
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		my $ns_pkt = $data->{$ns}->{queries}->{NS};
+
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		next if is_lame($soa_pkt);
+
+		# see if this nameserver lists all nameservers
+		#
+		my %all_ns;
+		foreach my $ns (keys %$data) { $all_ns{$ns} = 1; }
+		foreach my $ns (get_nslist($soa_pkt)) { delete $all_ns{$ns}; }
+		foreach my $ns (get_nslist($ns_pkt)) { delete $all_ns{$ns}; }
+		foreach my $ns (@lamers) { delete $all_ns{$ns}; }
+		if (keys %all_ns) {
+			$probs->{join(',', sort {$a cmp $b} keys %all_ns)}->{$ns} = 1;
+		}
+		$N++;
+	    }
+	    my @x;
+	    foreach my $k (keys %$probs) {
+		my $nses = join(',', sort {$a cmp $b} keys %{$probs->{$k}});
+		push(@x, "$nses do not list $k");
+	    }
+	    critical("NS RRset inconsistency: ". join('; ', @x)) if @x;
+	    success("$N namesevers have consistent NS RRset");
+	}
+
+	# NEW NSSET CHECK
+	if ($opts{M}) {
+	 	my @Llist = keys %$parent_data;
+		my %hash;
+		foreach my $ns (keys %$data) {
+			my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+			my $ns_pkt = $data->{$ns}->{queries}->{NS};
+			#
+			next unless is_response($soa_pkt);
+			next unless is_noerror($soa_pkt);
+			next if is_lame($soa_pkt);
+			#
+			foreach my $ns (get_nslist($soa_pkt)) { $hash{$ns}=1; }
+			foreach my $ns (get_nslist($ns_pkt)) { $hash{$ns}=1; }
+		}
+		my @Rlist = keys %hash;
+		my $lc = List::Compare->new(\@Llist, \@Rlist);
+		my @x;
+		push(@x, "AT PARENT ONLY: ". join(' ', $lc->get_Lonly)) if $lc->get_Lonly;
+		push(@x, "IN ZONE ONLY: ". join(' ', $lc->get_Ronly)) if $lc->get_Ronly;
+		critical (join('; ', @x)) if @x;
+		success("Parent and Zone NS RRSets match");
+	}
+
+
+	# AA CHECK
+	if ($opts{A}) {
+	    my $N = 0;
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		critical("%NS% claims is it not authoritative", $ns) unless $soa_pkt->header->aa;
+		$N++;
+	    }
+	    success("$N namesevers are authoritative");
+	}
+
+	# SERIAL CHECK
+	if ($opts{S}) {
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		my $serial = soa_serial($soa_pkt);
+		next unless $serial > 0;
+		$maxserial = $serial if ($serial > $maxserial);
+	    }
+	    my $N = 0;
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		my $serial = soa_serial($soa_pkt);
+		next unless $serial > 0;
+		$N++;
+		#
+		# tolerate off-by-one
+		#
+		next if ($maxserial - $serial < 2);
+		#
+		# if serial seems to be epoch-based, tolerate off by an hour
+		#
+		next if ((time - $maxserial < 3600) && ($maxserial - $serial < 3600));
+		#
+		# else, complain
+		#
+		critical("%NS% serial ($serial) is less than the maximum ($maxserial)", $ns);
+	    }
+	    success("$N nameservers have serial $maxserial");
+	}
+
+	# OPENRES CHECK
+	if ($opts{O}) {
+	    my $N = 0;
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		critical("%NS% is an open resolver", $ns) if test_recursion($ns);
+		$N++;
+	    }
+	    success("$N nameservers are closed to recursion");
+	}
+
+	# TCP CHECK
+	if ($opts{T}) {
+	    my $N = 0;
+	    my %broke = ();
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		$broke{$ns} = 1 unless test_tcp($ns);
+		$N++;
+	    }
+	    if (%broke) {
+		my $K = int(keys %broke);
+		my $such = (keys %broke)[0];
+		critical("$K of $N nameservers (such as %NS%) do not support TCP", $such);
+	    }
+	    success("$N nameservers support TCP");
+	}
+
+	# EDNS CHECK
+	if ($opts{E}) {
+	    my $N = 0;
+	    my $res = Net::DNS::Resolver->new;
+	    $res->udppacketsize(1024);
+	    $res->udp_timeout($opts{t});
+	    $res->tcp_timeout($opts{t});
+	    foreach my $ns (keys %$data) {
+		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
+		next unless is_response($soa_pkt);
+		next unless is_noerror($soa_pkt);
+		my @addrs = nsaddrs($ns);
+		unless (@addrs) {
+			critical("cant get nameservers for %NS%", $ns);
+		}
+		$res->nameserver(@addrs);
+		my $pkt = $res->send($zone, 'SOA');
+		critical("%NS% does not support EDNS0 (timeout)", $ns) unless $pkt;
+		my $rc = $pkt->header->rcode;
+		critical("%NS% does not support EDNS0 (rcode $rc)", $ns) unless $rc eq 'NOERROR';
+		$N++;
+	    }
+	    success("$N nameservers support EDNS0");
+	}
+
+	# IPV6 CHECK
+	if ($opts{6}) {
+	    my %xns = ();
+	    my $res = Net::DNS::Resolver->new;
+	    $res->udp_timeout($opts{t});
+	    $res->tcp_timeout($opts{t});
+	    foreach my $ns (keys %$data) {
+		printf STDERR "Does %s have an AAAA record?\n", $ns if $opts{d};
+		my $aaaa_pkt = $res->query($ns, 'AAAA');
+	    	next unless $aaaa_pkt;
+	    	next unless $aaaa_pkt->header->rcode eq 'NOERROR';
+		next unless $aaaa_pkt->header->ancount;
+		foreach my $rr ($aaaa_pkt->answer) {
+		 	# if this NS has multiple v6 addrs, we're only going test one
+			next unless $rr->type eq 'AAAA';
+			next unless lc($rr->name) eq lc($ns);
+			$xns{$ns} = $rr->address;
+			last;
+		}
+	    } continue {
+		printf STDERR defined($xns{$ns}) ? "YES\n" : "NO\n" if $opts{d};
+	    }
+	    my $N = 0;
+	    foreach my $ns (keys %xns) {
+		printf STDERR "Querying %s...\n", $xns{$ns} if $opts{d};
+		$res->nameserver($xns{$ns});
+		my $pkt = $res->send($zone, 'SOA');
+		critical("$ns does not support IPv6 (timeout)") unless $pkt;
+		my $rc = $pkt->header->rcode;
+		critical("%NS% does not support IPv6 (rcode $rc)", $ns, 'AAAA') unless $rc eq 'NOERROR';
+		$N++;
+	    }
+	    success("$N nameservers support IPv6");
+	}
+
+	## Clock skew
+	if ($opts{K}) {
+	    my $maxskew = 0;
+	    my $maxskew_ns = undef;
+	    my $N = 0;
+	    foreach my $ns (keys %$data) {
+		my $res = Net::DNS::Resolver->new;
+	        $res->udp_timeout($opts{t});
+	        $res->tcp_timeout($opts{t});
+		my @addrs = nsaddrs($ns);
+		unless (@addrs) {
+			critical("cant get nameservers for %NS%", $ns);
+		}
+		$res->nameserver(@addrs);
+		my $key_name = 'tldmon.dns-oarc.net';
+		my $key = 'deadbeef+deadbeef+dead==';	# anything;
+		my $query = Net::DNS::Packet->new('tldmon.dns-oarc.net');
+		my $tsig = Net::DNS::RR->new("$key_name, $key");
+		$query->push(additional => $tsig);
+		my $reply = $res->send($query);
+		next unless $reply;
+		foreach my $rr ($reply->additional) {
+        	    next unless $rr->type eq 'TSIG';
+        	    my $skew = abs(time - $rr->time_signed);
+		    print STDERR "$ns skew is $skew\n" if $opts{d};
+		    next if $skew < $maxskew;
+		    $maxskew = $skew;
+		    $maxskew_ns = $ns;
+		}
+		$N++;
+	    }
+	    critical("%NS% clock skew is $maxskew seconds", $maxskew_ns, 'A') if $maxskew > 60;
+	    warning("%NS% clock skew is $maxskew seconds", $maxskew_ns, 'A') if $maxskew > 15;
+	    success("$N nameservers clocks reasonably in sync");
+	}
+
+	die "oof";
+}
+
+sub add_nslist_to_data {
+	my $pkt = shift;
+	foreach my $ns (get_nslist($pkt)) {
+		next if defined $data->{$ns}->{done};
+		print STDERR "adding NS $ns\n" if $opts{d};
+		$data->{$ns}->{done} |= 0;
+	}
+}
+
+sub soa_serial {
+	my $pkt = shift;
+	foreach my $rr ($pkt->answer) {
+		next unless ($rr->type eq 'SOA');
+		next unless (lc($rr->name) eq lc($zone));
+		return $rr->serial;
+	}
+	return 0;
+}
+
+sub success {
+	output('OK', shift, shift);
+	exit(0);
+}
+
+sub warning {
+	my $msg = shift;
+	my $ns = shift;
+	my $atype = shift;
+	output('WARNING', $msg, $ns, $atype);
+	exit(1);
+}
+
+sub critical {
+	my $msg = shift;
+	my $ns = shift;
+	my $atype = shift;
+	warning($msg, $ns, $atype);
+	#output('CRITICAL', shift);
+	#exit(2);
+}
+
+sub output {
+	my $state = shift;
+	my $msg = shift;
+	my $ns = shift;
+	my $atype = shift;
+	my $hbind = HOSTNAME_BIND($ns, $atype) if $ns;
+	$ns = "$ns [$hbind]" if $hbind && $ns && lc($ns) ne lc($hbind);
+	$msg =~ s/%NS%/$ns/g if $ns;
+	$stop = [gettimeofday()] unless $stop;
+	my $latency = tv_interval($start, $stop);
+	printf "%s; (%.2fs) |time=%.6fs;;;0.000000\n",
+		$msg,
+		$latency,
+		$latency;
+}
+
+sub HOSTNAME_BIND {
+	my $ns = shift;
+	my $atype;
+	my $res = Net::DNS::Resolver->new;
+	$res->udp_timeout($opts{t});
+	$res->tcp_timeout($opts{t});
+	$atype = 'A' unless $atype;
+	if (my $pkt = send_query($ns, $atype)) {
+		foreach my $rr ($pkt->answer) {
+			if ($rr->type eq $atype) {
+				$ns = $rr->address;
+				last;
+			}
+		}
+	}
+	$res->nameserver($ns);
+	my $pkt = $res->query('HOSTNAME.BIND', 'TXT', 'CH');
+	return undef unless $pkt;
+	foreach my $rr ($pkt->answer) {
+		next unless $rr->type eq 'TXT';
+		next unless uc($rr->name) eq 'HOSTNAME.BIND';
+		my $str = lc $rr->txtdata;
+		$str =~ s/^\s+//;
+		$str =~ s/\s+$//;
+		return $str;
+	}
+	return undef;
+}
+
+sub usage {
+	print STDERR "usage: $0 -Z zone\n";
+	exit 3;
+}
+
+sub nsaddrs {
+	my $nsname = shift;
+	my @addrs;
+	my $res = Net::DNS::Resolver->new;
+	$res->udp_timeout($opts{t});
+	$res->tcp_timeout($opts{t});
+	foreach my $qtype ('A', 'AAAA') {
+		my $pkt = $res->query($nsname, $qtype);
+		next unless $pkt;
+		foreach my $rr ($pkt->answer) {
+			next unless $qtype eq $rr->type;
+			next unless lc($nsname) eq lc($rr->name);
+			print STDERR "nslookup $nsname has address ". $rr->address. "\n";
+			push(@addrs, $rr->address);
+		}
+	}
+	unless (@addrs) {
+		print STDERR "Unknown host $nsname\n" if $opts{d};
+#		push(@addrs, $nsname);
+	}
+	return @addrs;
+}
+
+sub send_query {
+	my $qname = lc(shift);
+	my $qtype = shift;
+	my $server = shift;
+	my $res = Net::DNS::Resolver->new;
+	$res->udp_timeout($opts{t});
+	$res->tcp_timeout($opts{t});
+	if ($server) {
+		my @addrs = nsaddrs($server);
+		return 0 unless (@addrs);
+		$res->nameserver(@addrs);
+	}
+	return $res->send($qname, $qtype);
+}
+
+sub test_recursion {
+	my $qname = time . '.wildcard.openresolvers.org';
+	my $qtype = 'A';
+	my $server = shift;
+	my $res = Net::DNS::Resolver->new;
+	if ($server) {
+		my @addrs = nsaddrs($server);
+		return 0 unless (@addrs);
+		$res->nameserver(@addrs);
+	}
+	$res->udp_timeout($opts{t});
+	$res->tcp_timeout($opts{t});
+	my $pkt = $res->send($qname, $qtype);
+	return 0 unless $pkt;
+	return 0 unless $pkt->header->rcode eq 'NOERROR';
+	return 0 unless $pkt->header->ancount;
+	foreach my $rr ($pkt->answer) {
+		next unless $rr->type eq 'A';
+		next unless (lc($rr->name) eq lc($qname));
+		return 1 if $rr->address eq '127.0.0.2';
+	}
+	return 0;
+}
+
+sub test_tcp {
+	my $server = shift;
+	my $res = Net::DNS::Resolver->new;
+	if ($server) {
+		my @addrs = nsaddrs($server);
+		return 0 unless (@addrs);
+		$res->nameserver(@addrs);
+	}
+	$res->tcp_timeout($opts{t});
+	$res->usevc(1);
+	my $pkt = $res->send($zone, 'SOA');
+	return 0 unless $pkt;
+	return 0 unless $pkt->header->rcode eq 'NOERROR';
+	#return 0 unless $pkt->header->ancount;
+	return 1;
+}
+
+sub get_nslist {
+	my $pkt = shift;
+	return () unless $pkt;
+	my @nslist = ();
+	foreach my $rr ($pkt->authority) {
+		next unless ($rr->type eq 'NS');
+		next unless (lc($rr->name) eq lc($zone));
+		push(@nslist, lc($rr->nsdname));
+	}
+	return @nslist if @nslist;
+	#
+	# look for NS records in answer section too
+	#
+	foreach my $rr ($pkt->answer) {
+		next unless ($rr->type eq 'NS');
+		next unless (lc($rr->name) eq lc($zone));
+		push(@nslist, lc($rr->nsdname));
+	}
+	return @nslist;
+}
